@@ -62,7 +62,7 @@ def generate_stats_json(df: pd.DataFrame):
 
 
 # --- 3. メインのAPIエンドポイント ---
-@app.post("/verify-audio") # 課題でパスが指定されていない場合はここを変更してください
+@app.post("/invoice-intel") # 課題でパスが指定されていない場合はここを変更してください
 async def process_audio(req: AudioRequest):
     try:
         # A. Base64の文字列を綺麗にする
