@@ -78,16 +78,26 @@ def transcribe_table_from_audio(audio_bytes: bytes):
 
     prompt = (
         "Listen carefully to this audio. It contains someone reading out "
-        "a small dataset out loud - column names and rows of data values. "
-        "The audio may be in Korean or another language; transcribe and "
-        "understand it regardless of language, then translate any labels "
-        "into their plain values.\n\n"
+        "a small dataset out loud - one or more named variables, and a "
+        "value for that variable on each row.\n\n"
+        "IMPORTANT RULES:\n"
+        "1. Do NOT invent a column for row numbers, indices, or ordinal "
+        "markers (e.g. 'row 1', '첫 번째', '두 번째', '1번', 'first', "
+        "'second'). These only indicate position/order - they are NOT "
+        "data columns. Only include a column if it is an actual named "
+        "variable that has a value (e.g. a score, a name, an age).\n"
+        "2. Keep column names EXACTLY as spoken in the audio, in the "
+        "original language - do NOT translate them into English or any "
+        "other language.\n"
+        "3. The audio may be in Korean or another language; transcribe "
+        "and understand it regardless of language, but keep labels as-is.\n\n"
         "Return the data as a table:\n"
-        "- 'columns': the list of column names, in the order mentioned\n"
+        "- 'columns': the list of actual data column names, in the order "
+        "first mentioned (excluding any row/index markers)\n"
         "- 'data': a list of rows, each row a list of values (as plain "
         "strings) in the SAME ORDER as 'columns'\n\n"
         "Keep numbers as plain numeric strings (e.g. '42', '3.5') and "
-        "categories/text as plain strings."
+        "categories/text as plain strings, unchanged from the original language."
     )
 
     response = None
