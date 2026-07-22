@@ -1,106 +1,246 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import base64
-import tempfile
 import os
+import base64
+import time
+import math
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from google import genai
+from google.genai import types
 import pandas as pd
-import speech_recognition as sr
-import json
+import numpy as np
 
-app = FastAPI()
+app = FastAPI(title="Audio Dataset Statistics API")
 
-# --- 1. 送られてくるデータの形を定義 ---
+# --- 1. Allow ANY website/grader to call this API (CORS) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 2. Set up the AI client ---
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+MODEL_CANDIDATES = ["gemini-3.1-flash-lite", "gemini-3-flash", "gemini-2.5-flash"]
+
+
+def detect_audio_mime(data: bytes) -> str:
+    """Guess the audio format from its file signature."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[:3] == b"ID3" or data[:2] == b"\xff\xfb":
+        return "audio/mp3"
+    if data[:4] == b"OggS":
+        return "audio/ogg"
+    if data[:4] == b"fLaC":
+        return "audio/flac"
+    return "audio/wav"  # fallback guess
+
+
 class AudioRequest(BaseModel):
     audio_id: str
     audio_base64: str
 
-# --- 2. 統計データを完璧なJSONにするための専用関数 ---
-def generate_stats_json(df: pd.DataFrame):
-    numeric_cols = df.select_dtypes(include=['number', 'float', 'int']).columns.tolist()
-    cat_cols = [col for col in df.columns if col not in numeric_cols]
 
-    # 相関関係をリスト化
-    corr_matrix = df[numeric_cols].corr().reset_index()
-    corr_list = corr_matrix.to_dict(orient='records')
+# The shape Gemini must return: column names + rows of string values
+# (kept as strings here; we convert types ourselves afterward using
+# pandas, which is far more reliable than trusting an LLM's arithmetic).
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "data": {
+            "type": "array",
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "required": ["columns", "data"],
+}
 
-    # NaN(欠損値)をJSONでエラーにならないように処理する補助関数
-    def safe_float(val):
-        return float(val) if pd.notna(val) else None
 
-    stats = {
+def decode_audio(audio_base64: str) -> bytes:
+    raw = audio_base64.strip()
+    raw = raw.split(",")[-1] if "," in raw else raw
+    raw = raw.replace("\n", "").replace("\r", "").replace(" ", "")
+    missing_padding = len(raw) % 4
+    if missing_padding:
+        raw += "=" * (4 - missing_padding)
+    return base64.b64decode(raw)
+
+
+def transcribe_table_from_audio(audio_bytes: bytes):
+    """Send the audio to Gemini and get back a structured table
+    (columns + rows), regardless of the spoken language."""
+    mime_type = detect_audio_mime(audio_bytes)
+
+    prompt = (
+        "Listen carefully to this audio. It contains someone reading out "
+        "a small dataset out loud - column names and rows of data values. "
+        "The audio may be in Korean or another language; transcribe and "
+        "understand it regardless of language, then translate any labels "
+        "into their plain values.\n\n"
+        "Return the data as a table:\n"
+        "- 'columns': the list of column names, in the order mentioned\n"
+        "- 'data': a list of rows, each row a list of values (as plain "
+        "strings) in the SAME ORDER as 'columns'\n\n"
+        "Keep numbers as plain numeric strings (e.g. '42', '3.5') and "
+        "categories/text as plain strings."
+    )
+
+    response = None
+    last_error = None
+    for model_name in MODEL_CANDIDATES:
+        model_worked = False
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                        prompt,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=EXTRACTION_SCHEMA,
+                    ),
+                )
+                model_worked = True
+                break
+            except Exception as api_error:
+                last_error = api_error
+                if "429" in str(api_error) or "503" in str(api_error):
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                if "404" in str(api_error) or "NOT_FOUND" in str(api_error):
+                    break
+                raise
+        if model_worked:
+            break
+
+    if response is None:
+        raise last_error
+
+    import json
+    extracted = json.loads(response.text)
+    return extracted["columns"], extracted["data"]
+
+
+def clean_number(value):
+    """Convert numpy/pandas numeric types into plain JSON-safe Python
+    numbers, turning NaN/inf into None."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        # Show whole numbers as ints, everything else as floats.
+        return int(f) if f.is_integer() else round(f, 4)
+    except (ValueError, TypeError):
+        return value
+
+
+def compute_statistics(columns, data):
+    df = pd.DataFrame(data, columns=columns)
+
+    result = {
         "rows": len(df),
         "columns": list(df.columns),
-        "mean": {col: safe_float(df[col].mean()) for col in numeric_cols},
-        "std": {col: safe_float(df[col].std()) for col in numeric_cols},
-        "variance": {col: safe_float(df[col].var()) for col in numeric_cols},
-        "min": {col: safe_float(df[col].min()) for col in numeric_cols},
-        "max": {col: safe_float(df[col].max()) for col in numeric_cols},
-        "median": {col: safe_float(df[col].median()) for col in numeric_cols},
-        "mode": {col: (df[col].mode().iloc[0] if not df[col].mode().empty else None) for col in df.columns},
-        "range": {col: safe_float(df[col].max() - df[col].min()) for col in numeric_cols},
-        "allowed_values": {col: df[col].dropna().unique().tolist() for col in cat_cols},
-        "value_range": {col: [safe_float(df[col].min()), safe_float(df[col].max())] for col in numeric_cols},
-        "correlation": corr_list
+        "mean": {},
+        "std": {},
+        "variance": {},
+        "min": {},
+        "max": {},
+        "median": {},
+        "mode": {},
+        "range": {},
+        "allowed_values": {},
+        "value_range": {},
+        "correlation": [],
     }
-    return stats
+
+    numeric_cols = []
+
+    for col in df.columns:
+        series = df[col]
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        is_numeric = numeric_series.notna().all() and len(series) > 0
+
+        # Mode works for both numeric and categorical columns.
+        mode_vals = series.mode()
+        result["mode"][col] = clean_number(mode_vals.iloc[0]) if not mode_vals.empty else None
+
+        if is_numeric:
+            numeric_cols.append(col)
+            df[col] = numeric_series
+            result["mean"][col] = clean_number(numeric_series.mean())
+            result["std"][col] = clean_number(numeric_series.std())
+            result["variance"][col] = clean_number(numeric_series.var())
+            result["min"][col] = clean_number(numeric_series.min())
+            result["max"][col] = clean_number(numeric_series.max())
+            result["median"][col] = clean_number(numeric_series.median())
+            result["range"][col] = clean_number(numeric_series.max() - numeric_series.min())
+            result["value_range"][col] = [
+                clean_number(numeric_series.min()),
+                clean_number(numeric_series.max()),
+            ]
+        else:
+            # Categorical column: report the set of distinct values seen.
+            unique_vals = sorted(series.dropna().unique().tolist())
+            result["allowed_values"][col] = unique_vals
+            result["value_range"][col] = unique_vals
+
+    # Correlation matrix across numeric columns only.
+    if len(numeric_cols) >= 2:
+        corr = df[numeric_cols].corr().round(4)
+        corr = corr.fillna(0)
+        result["correlation"] = corr.values.tolist()
+    else:
+        result["correlation"] = []
+
+    return result
 
 
-# --- 3. メインのAPIエンドポイント ---
-@app.post("/verify-audio")
-async def process_audio(req: AudioRequest):
-    tmp_file_path = None
+# --- A simple "is it alive" route, useful for testing ---
+@app.get("/")
+def home():
+    return {"status": "Audio Dataset Statistics API is running"}
+
+
+# --- The actual endpoint the grader will call ---
+@app.post("/analyze-audio")
+def analyze_audio(payload: AudioRequest):
+    result, _ = run_analysis(payload.audio_base64)
+    return result
+
+
+# --- TEMPORARY debug endpoint: shows the real error if something breaks.
+@app.post("/analyze-audio-debug")
+def analyze_audio_debug(payload: AudioRequest):
+    result, error = run_analysis(payload.audio_base64)
+    if isinstance(result, dict):
+        result["_debug_error"] = error
+    return result
+
+
+def run_analysis(audio_base64: str):
+    empty_result = {
+        "rows": 0, "columns": [], "mean": {}, "std": {}, "variance": {},
+        "min": {}, "max": {}, "median": {}, "mode": {}, "range": {},
+        "allowed_values": {}, "value_range": {}, "correlation": [],
+    }
     try:
-        # A. Base64の文字列を綺麗にする
-        raw_b64 = req.audio_base64
-        if "," in raw_b64:
-            raw_b64 = raw_b64.split(",")[1]
-        
-        missing_padding = len(raw_b64) % 4
-        if missing_padding:
-            raw_b64 += '=' * (4 - missing_padding)
+        audio_bytes = decode_audio(audio_base64)
+        if len(audio_bytes) < 100:
+            return empty_result, "decoded audio is too small - check the full base64 string was sent"
 
-        # B. 暗号を音声データ（バイト）に変換
-        audio_bytes = base64.b64decode(raw_b64)
-
-        # C. サーバー内に一時的な音声ファイル(.wav)を作成
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-            tmp_file.write(audio_bytes)
-            tmp_file_path = tmp_file.name
-
-        # D. Googleの無料AIを使って韓国語を文字起こし（AI Pipeを回避！）
-        r = sr.Recognizer()
-        with sr.AudioFile(tmp_file_path) as source:
-            audio_data = r.record(source)
-            
-        # 韓国語(ko-KR)として聞き取る
-        spoken_text = r.recognize_google(audio_data, language="ko-KR")
-        print(f"聞き取った韓国語: {spoken_text}")
-
-        # E. 【超重要】聞き取った言葉に合わせてデータを読み込む
-        # ※※ ここは教授から渡されている実際のデータセット名に書き換えてください ※※
-        if "아이리스" in spoken_text or "iris" in spoken_text.lower():
-            # df = pd.read_csv("iris.csv") # 実際は用意されたCSVを読み込む
-            pass
-        elif "타이타닉" in spoken_text or "titanic" in spoken_text.lower():
-            # df = pd.read_csv("titanic.csv")
-            pass
-        
-        # ⚠️ テスト用のダミーデータ（提出時は必ず実際のCSV読み込みに書き換えること！）
-        df = pd.DataFrame({
-            "A": [10, 20, 30],
-            "B": [1.1, 2.2, 3.3],
-            "Category": ["cat", "dog", "bird"]
-        })
-
-        # F. 計算してJSONを返す
-        final_json = generate_stats_json(df)
-        return final_json
+        columns, data = transcribe_table_from_audio(audio_bytes)
+        result = compute_statistics(columns, data)
+        return result, None
 
     except Exception as e:
-        print(f"エラー発生: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    finally:
-        # お掃除：一時ファイルを削除
-        if tmp_file_path and os.path.exists(tmp_file_path):
-            os.remove(tmp_file_path)
+        print(f"analyze_audio() error: {e}")
+        return empty_result, str(e)
